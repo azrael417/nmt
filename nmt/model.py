@@ -21,6 +21,7 @@ from __future__ import print_function
 import abc
 
 import tensorflow as tf
+import horovod.tensorflow as hvd
 
 from tensorflow.python.layers import core as layers_core
 
@@ -125,7 +126,7 @@ class BaseModel(object):
       self.predict_count = tf.reduce_sum(
           self.iterator.target_sequence_length)
 
-    self.global_step = tf.Variable(0, trainable=False)
+    self.global_step = tf.train.get_or_create_global_step()
     params = tf.trainable_variables()
 
     # Gradients and SGD update operation for training the model.
@@ -140,9 +141,11 @@ class BaseModel(object):
       # Optimizer
       if hparams.optimizer == "sgd":
         opt = tf.train.GradientDescentOptimizer(self.learning_rate)
+        opt = hvd.DistributedOptimizer(opt)
         tf.summary.scalar("lr", self.learning_rate)
       elif hparams.optimizer == "adam":
         opt = tf.train.AdamOptimizer(self.learning_rate)
+        opt = hvd.DistributedOptimizer(opt)
 
       # Gradients
       gradients = tf.gradients(

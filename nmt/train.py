@@ -21,6 +21,7 @@ import random
 import time
 
 import tensorflow as tf
+import horovod.tensorflow as hvd
 
 from . import attention_model
 from . import gnmt_model
@@ -268,8 +269,13 @@ def before_train(loaded_train_model, train_model, train_sess, global_step,
   return stats, info, start_train_time
 
 
-def train(hparams, scope=None, target_session=""):
+def train(hparams, scope=None):
   """Train a translation model."""
+  
+  #init horovod
+  hvd.init()
+  
+  #some logging parameters
   log_device_placement = hparams.log_device_placement
   out_dir = hparams.out_dir
   num_train_steps = hparams.num_train_steps
@@ -316,156 +322,144 @@ def train(hparams, scope=None, target_session=""):
       log_device_placement=log_device_placement,
       num_intra_threads=hparams.num_intra_threads,
       num_inter_threads=hparams.num_inter_threads)
-  train_sess = tf.Session(
-      target=target_session, config=config_proto, graph=train_model.graph)
-  eval_sess = tf.Session(
-      target=target_session, config=config_proto, graph=eval_model.graph)
-  infer_sess = tf.Session(
-      target=target_session, config=config_proto, graph=infer_model.graph)
+  #session hooks
+  hooks = [tf.train.StopAtStepHook(last_step = num_train_steps), hvd.BroadcastGlobalVariablesHook(0)]
+  #checkpoint saver hook for rank0:
+  if hvd.rank() == 0:
+    with train_model.graph.as_default():
+      checkpoint_save_freq = num_train_steps // 20
+      checkpoint_saver = tf.train.Saver(max_to_keep = 1000)
+      hooks.append(tf.train.CheckpointSaverHook(checkpoint_dir=model_dir, save_steps=checkpoint_save_freq, saver=checkpoint_saver))
 
-  with train_model.graph.as_default():
-    loaded_train_model, global_step = model_helper.create_or_load_model(
-        train_model.model, model_dir, train_sess, "train")
+  #create sessions
+  #eval_sess = tf.train.MonitoredTrainingSession(config=config_proto, graph=eval_model.graph)
+  #infer_sess = tf.train.MonitoredTrainingSession(config=config_proto, graph=infer_model.graph)
 
   # Summary writer
-  summary_writer = tf.summary.FileWriter(
-      os.path.join(out_dir, summary_name), train_model.graph)
+  #summary_writer = tf.summary.FileWriter(
+  #    os.path.join(out_dir, summary_name), train_model.graph)
 
-  # First evaluation
-  run_full_eval(
-      model_dir, infer_model, infer_sess,
-      eval_model, eval_sess, hparams,
-      summary_writer, sample_src_data,
-      sample_tgt_data, avg_ckpts)
 
-  last_stats_step = global_step
-  last_eval_step = global_step
-  last_external_eval_step = global_step
-
-  # This is the training loop.
-  stats, info, start_train_time = before_train(
-      loaded_train_model, train_model, train_sess, global_step, hparams, log_f)
-  while global_step < num_train_steps:
-    ### Run a step ###
-    start_time = time.time()
-    try:
-      step_result = loaded_train_model.train(train_sess)
-      hparams.epoch_step += 1
-    except tf.errors.OutOfRangeError:
-      # Finished going through the training dataset.  Go to next epoch.
-      hparams.epoch_step = 0
-      utils.print_out(
-          "# Finished an epoch, step %d. Perform external evaluation" %
-          global_step)
-      run_sample_decode(infer_model, infer_sess, model_dir, hparams,
-                        summary_writer, sample_src_data, sample_tgt_data)
-      run_external_eval(infer_model, infer_sess, model_dir, hparams,
-                        summary_writer)
-
-      if avg_ckpts:
-        run_avg_external_eval(infer_model, infer_sess, model_dir, hparams,
-                              summary_writer, global_step)
-
-      train_sess.run(
-          train_model.iterator.initializer,
-          feed_dict={train_model.skip_count_placeholder: 0})
-      continue
-
-    # Process step_result, accumulate stats, and write summary
-    global_step, info["learning_rate"], step_summary = update_stats(
-        stats, start_time, step_result)
-    summary_writer.add_summary(step_summary, global_step)
-
-    # Once in a while, we print statistics.
-    if global_step - last_stats_step >= steps_per_stats:
+  #do that in the monitored training session:
+  with train_model.graph.as_default():
+    
+    #start monitored training session:
+    with tf.train.MonitoredTrainingSession(config=config_proto, hooks=hooks) as train_sess:
+      
+      #load model, get stats, etc
+      loaded_train_model, global_step = model_helper.create_or_load_model(train_model.model, model_dir, train_sess, "train")
+      
+      #set some step counts
       last_stats_step = global_step
-      is_overflow = process_stats(
-          stats, info, global_step, steps_per_stats, log_f)
-      print_step_info("  ", global_step, info, _get_best_results(hparams),
-                      log_f)
-      if is_overflow:
-        break
-
-      # Reset statistics
-      stats = init_stats()
-
-    if global_step - last_eval_step >= steps_per_eval:
       last_eval_step = global_step
-      utils.print_out("# Save eval, global step %d" % global_step)
-      utils.add_summary(summary_writer, global_step, "train_ppl",
-                        info["train_ppl"])
-
-      # Save checkpoint
-      loaded_train_model.saver.save(
-          train_sess,
-          os.path.join(out_dir, "translate.ckpt"),
-          global_step=global_step)
-
-      # Evaluate on dev/test
-      run_sample_decode(infer_model, infer_sess,
-                        model_dir, hparams, summary_writer, sample_src_data,
-                        sample_tgt_data)
-      run_internal_eval(
-          eval_model, eval_sess, model_dir, hparams, summary_writer)
-
-    if global_step - last_external_eval_step >= steps_per_external_eval:
       last_external_eval_step = global_step
+      stats, info, start_train_time = before_train(loaded_train_model, train_model, train_sess, global_step, hparams, log_f)
+      
+      # This is the training loop.
+      while global_step < num_train_steps:
+        
+        ### Run a step ###
+        start_time = time.time()
+        try:
+          step_result = loaded_train_model.train(train_sess)
+          hparams.epoch_step += 1
+        except tf.errors.OutOfRangeError:
+          # Finished going through the training dataset.  Go to next epoch.
+          hparams.epoch_step = 0
+          utils.print_out("# Rank %i finished an epoch, step %d. Perform external evaluation" %(hvd.rank(),global_step))
+          #run_sample_decode(infer_model, infer_sess, model_dir, hparams, summary_writer, sample_src_data, sample_tgt_data)
+          #run_external_eval(infer_model, infer_sess, model_dir, hparams, summary_writer)
 
-      # Save checkpoint
-      loaded_train_model.saver.save(
-          train_sess,
-          os.path.join(out_dir, "translate.ckpt"),
-          global_step=global_step)
-      run_sample_decode(infer_model, infer_sess,
-                        model_dir, hparams, summary_writer, sample_src_data,
-                        sample_tgt_data)
-      run_external_eval(
-          infer_model, infer_sess, model_dir,
-          hparams, summary_writer)
+          #if avg_ckpts:
+          #  run_avg_external_eval(infer_model, infer_sess, model_dir, hparams, summary_writer, global_step)
 
-      if avg_ckpts:
-        run_avg_external_eval(infer_model, infer_sess, model_dir, hparams,
-                              summary_writer, global_step)
+          train_sess.run(train_model.iterator.initializer, feed_dict={train_model.skip_count_placeholder: 0})
+          continue
+        end_time = time.time()
 
-  # Done training
-  loaded_train_model.saver.save(
-      train_sess,
-      os.path.join(out_dir, "translate.ckpt"),
-      global_step=global_step)
+        # Process step_result, accumulate stats, and write summary
+        global_step, info["learning_rate"], step_summary = update_stats(stats, start_time, step_result)
+        #summary_writer.add_summary(step_summary, global_step)
 
-  (result_summary, _, final_eval_metrics) = (
-      run_full_eval(
-          model_dir, infer_model, infer_sess, eval_model, eval_sess, hparams,
-          summary_writer, sample_src_data, sample_tgt_data, avg_ckpts))
-  print_step_info("# Final, ", global_step, info, result_summary, log_f)
-  utils.print_time("# Done training!", start_train_time)
+        # Once in a while, we print statistics.
+        if global_step - last_stats_step >= steps_per_stats:
+          last_stats_step = global_step
+          is_overflow = process_stats(stats, info, global_step, steps_per_stats, log_f)
+          print_step_info("  ", global_step, info, _get_best_results(hparams),log_f)
+          if is_overflow:
+            break
+          # Reset statistics
+          stats = init_stats()
 
-  summary_writer.close()
 
-  utils.print_out("# Start evaluating saved best models.")
-  for metric in hparams.metrics:
-    best_model_dir = getattr(hparams, "best_" + metric + "_dir")
-    summary_writer = tf.summary.FileWriter(
-        os.path.join(best_model_dir, summary_name), infer_model.graph)
-    result_summary, best_global_step, _ = run_full_eval(
-        best_model_dir, infer_model, infer_sess, eval_model, eval_sess, hparams,
-        summary_writer, sample_src_data, sample_tgt_data)
-    print_step_info("# Best %s, " % metric, best_global_step, info,
-                    result_summary, log_f)
-    summary_writer.close()
+        #if global_step - last_eval_step >= steps_per_eval:
+          #last_eval_step = global_step
+          #utils.print_out("# Save eval, global step %d" % global_step)
+          #utils.add_summary(summary_writer, global_step, "train_ppl", info["train_ppl"])
 
-    if avg_ckpts:
-      best_model_dir = getattr(hparams, "avg_best_" + metric + "_dir")
-      summary_writer = tf.summary.FileWriter(
-          os.path.join(best_model_dir, summary_name), infer_model.graph)
-      result_summary, best_global_step, _ = run_full_eval(
-          best_model_dir, infer_model, infer_sess, eval_model, eval_sess,
-          hparams, summary_writer, sample_src_data, sample_tgt_data)
-      print_step_info("# Averaged Best %s, " % metric, best_global_step, info,
-                      result_summary, log_f)
-      summary_writer.close()
+          # Save checkpoint
+          #loaded_train_model.saver.save(train_sess, os.path.join(out_dir, "translate.ckpt"),global_step=global_step)
 
-  return final_eval_metrics, global_step
+          # Evaluate on dev/test  
+          #run_sample_decode(infer_model, infer_sess, model_dir, hparams, summary_writer, sample_src_data, sample_tgt_data)
+          #run_internal_eval(eval_model, eval_sess, model_dir, hparams, summary_writer)
+
+        #if global_step - last_external_eval_step >= steps_per_external_eval:
+          #last_external_eval_step = global_step
+
+          # Save checkpoint
+          #loaded_train_model.saver.save(train_sess, os.path.join(out_dir, "translate.ckpt"), global_step=global_step)
+          #run_sample_decode(infer_model, infer_sess, model_dir, hparams, summary_writer, sample_src_data, sample_tgt_data)
+          #run_external_eval(infer_model, infer_sess, model_dir, hparams, summary_writer)
+
+        #if avg_ckpts:
+          #run_avg_external_eval(infer_model, infer_sess, model_dir, hparams, summary_writer, global_step)
+
+
+
+
+
+
+#  # Done training
+#  loaded_train_model.saver.save(
+#      train_sess,
+#      os.path.join(out_dir, "translate.ckpt"),
+#      global_step=global_step)
+#
+#  (result_summary, _, final_eval_metrics) = (
+#      run_full_eval(
+#          model_dir, infer_model, infer_sess, eval_model, eval_sess, hparams,
+#          summary_writer, sample_src_data, sample_tgt_data, avg_ckpts))
+#  print_step_info("# Final, ", global_step, info, result_summary, log_f)
+#  utils.print_time("# Done training!", start_train_time)
+#
+#  summary_writer.close()
+#
+#  utils.print_out("# Start evaluating saved best models.")
+#  for metric in hparams.metrics:
+#    best_model_dir = getattr(hparams, "best_" + metric + "_dir")
+#    summary_writer = tf.summary.FileWriter(
+#        os.path.join(best_model_dir, summary_name), infer_model.graph)
+#    result_summary, best_global_step, _ = run_full_eval(
+#        best_model_dir, infer_model, infer_sess, eval_model, eval_sess, hparams,
+#        summary_writer, sample_src_data, sample_tgt_data)
+#    print_step_info("# Best %s, " % metric, best_global_step, info,
+#                    result_summary, log_f)
+#    summary_writer.close()
+#
+#    if avg_ckpts:
+#      best_model_dir = getattr(hparams, "avg_best_" + metric + "_dir")
+#      summary_writer = tf.summary.FileWriter(
+#          os.path.join(best_model_dir, summary_name), infer_model.graph)
+#      result_summary, best_global_step, _ = run_full_eval(
+#          best_model_dir, infer_model, infer_sess, eval_model, eval_sess,
+#          hparams, summary_writer, sample_src_data, sample_tgt_data)
+#      print_step_info("# Averaged Best %s, " % metric, best_global_step, info,
+#                      result_summary, log_f)
+#      summary_writer.close()
+#
+#  return final_eval_metrics, global_step
+  return 0
 
 
 def _format_results(name, ppl, scores, metrics):

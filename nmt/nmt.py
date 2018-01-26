@@ -289,6 +289,7 @@ def add_arguments(parser):
 
 def create_hparams(flags):
   """Create training hparams."""
+  
   return tf.contrib.training.HParams(
       # Data
       src=flags.src,
@@ -539,7 +540,7 @@ def create_or_load_hparams(
   return hparams
 
 
-def run_main(flags, default_hparams, train_fn, inference_fn, target_session=""):
+def run_main(flags, default_hparams, train_fn, inference_fn):
   """Run main."""
   # Job
   jobid = flags.jobid
@@ -588,7 +589,7 @@ def run_main(flags, default_hparams, train_fn, inference_fn, target_session=""):
         utils.print_out("  %s: %.1f" % (metric, score))
   else:
     # Train
-    train_fn(hparams, target_session=target_session)
+    train_fn(hparams)
 
 
 def main(unused_argv):
