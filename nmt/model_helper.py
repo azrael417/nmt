@@ -8,6 +8,7 @@ import time
 
 import numpy as np
 import tensorflow as tf
+import horovod.tensorflow as hvd
 
 from tensorflow.python.ops import lookup_ops
 
@@ -59,8 +60,7 @@ class ExtraArgs(collections.namedtuple(
 
 
 class TrainModel(
-    collections.namedtuple("TrainModel", ("graph", "model", "iterator",
-                                          "skip_count_placeholder"))):
+    collections.namedtuple("TrainModel", ("graph", "model", "iterator", "skip_count_placeholder"))):
   pass
 
 
@@ -81,6 +81,12 @@ def create_train_model(
 
     src_dataset = tf.data.TextLineDataset(src_file)
     tgt_dataset = tf.data.TextLineDataset(tgt_file)
+    
+    #shard the dataset for distributed processing:
+    src_dataset = src_dataset.shard(num_shards=hvd.size(), index=hvd.rank())
+    tgt_dataset = tgt_dataset.shard(num_shards=hvd.size(), index=hvd.rank())
+    
+    #skip placeholder
     skip_count_placeholder = tf.placeholder(shape=(), dtype=tf.int64)
 
     iterator = iterator_utils.get_iterator(
@@ -113,11 +119,7 @@ def create_train_model(
           scope=scope,
           extra_args=extra_args)
 
-  return TrainModel(
-      graph=graph,
-      model=model,
-      iterator=iterator,
-      skip_count_placeholder=skip_count_placeholder)
+  return TrainModel(graph=graph, model=model, iterator=iterator, skip_count_placeholder=skip_count_placeholder)
 
 
 class EvalModel(
@@ -478,10 +480,10 @@ def gradient_clip(gradients, max_gradient_norm):
   return clipped_gradients, gradient_norm_summary, gradient_norm
 
 
-def load_model(model, ckpt, session, name):
+def load_model(model, ckpt, session, init_tables_op, name):
   start_time = time.time()
   model.saver.restore(session, ckpt)
-  session.run(tf.tables_initializer())
+  session.run(init_tables_op)
   utils.print_out(
       "  loaded %s model parameters from %s, time %.2fs" %
       (name, ckpt, time.time() - start_time))
@@ -561,19 +563,19 @@ def avg_checkpoints(model_dir, num_last_checkpoints, global_step,
   return avg_model_dir
 
 
-def create_or_load_model(model, model_dir, session, name):
+def create_or_load_model(model, model_dir, session, init_global_variables_op, init_tables_op, name):
   """Create translation model and initialize or load parameters in session."""
+  start_time = time.time()
   latest_ckpt = tf.train.latest_checkpoint(model_dir)
   if latest_ckpt:
-    model = load_model(model, latest_ckpt, session, name)
+    model = load_model(model, latest_ckpt, session, init_tables_op, name)
   else:
-    start_time = time.time()
-    session.run(tf.global_variables_initializer())
-    session.run(tf.tables_initializer())
-    utils.print_out("  created %s model with fresh parameters, time %.2fs" %
-                    (name, time.time() - start_time))
+    #init variables
+    session.run([init_global_variables_op, init_tables_op])
+    utils.print_out("  created %s model with fresh parameters, time %.2fs" %(name, time.time() - start_time))
 
   global_step = model.global_step.eval(session=session)
+    
   return model, global_step
 
 
